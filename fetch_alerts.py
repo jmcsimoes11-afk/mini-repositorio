@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 import re
 import sys
+import time
 from typing import Iterable
 from urllib.parse import urlparse
 import urllib.error
@@ -24,21 +25,27 @@ ALLOWED_DOMAINS = frozenset({
     "www.metromondego.pt",
 })
 
+DEFAULT_FALLBACK_URL = "https://jmcsimoes11-afk.github.io/mini-repositorio/avisos.json"
+
 SOURCES = (
     (
         "SMTUC",
-        "https://www.smtuc.pt/wp-json/wp/v2/posts?_fields=id,date_gmt,link,title,excerpt&per_page=20",
+        "https://www.smtuc.pt/wp-json/wp/v2/posts?_fields=id,date_gmt,modified_gmt,link,title,excerpt&per_page=20",
+        45,
     ),
     (
         "SIT",
-        "https://sit-regiaodecoimbra.pt/wp-json/wp/v2/posts?_fields=id,date_gmt,link,title,excerpt&per_page=20",
+        "https://sit-regiaodecoimbra.pt/wp-json/wp/v2/posts?_fields=id,date_gmt,modified_gmt,link,title,excerpt&per_page=20",
+        180,
     ),
 )
 
-USER_AGENT = "MobilidadeCoimbraAlerts/1.0 (+https://github.com/jmcsimoes11-afk/mini-repositorio)"
+USER_AGENT = "MobilidadeCoimbraAlerts/1.1 (+https://github.com/jmcsimoes11-afk/mini-repositorio)"
 MAX_SUMMARY_CHARS = 280
 MAX_ALERTS = 50
 DEFAULT_MAX_AGE_DAYS = 45
+FETCH_TIMEOUT_SECONDS = 25
+FETCH_RETRIES = 3
 
 
 class _TextExtractor(HTMLParser):
@@ -89,6 +96,8 @@ def classify_category(title: str, summary: str) -> str:
             "alteracao de percurso",
             "alteração percurso",
             "alteracao percurso",
+            "alteração paragem",
+            "alteracao paragem",
             "percurso alternativo",
             "corte",
             "cortada",
@@ -176,13 +185,15 @@ def parse_wp_posts(
         post_id = post.get("id")
         url = validate_official_url(str(post.get("link") or ""))
         published = parse_wp_gmt_timestamp(str(post.get("date_gmt") or ""))
+        modified = parse_wp_gmt_timestamp(str(post.get("modified_gmt") or ""))
+        effective_ts = max(published, modified) if (published and modified) else (published or modified)
         title_raw = (post.get("title") or {}).get("rendered", "")
         excerpt_raw = (post.get("excerpt") or {}).get("rendered", "")
         title = strip_html(str(title_raw))
         summary = truncate_summary(strip_html(str(excerpt_raw)))
-        if not post_id or not url or not published or not title:
+        if not post_id or not url or not effective_ts or not title:
             continue
-        if published < cutoff:
+        if effective_ts < cutoff:
             continue
         category = classify_category(title, summary)
         lines = extract_affected_lines(title, summary)
@@ -194,7 +205,7 @@ def parse_wp_posts(
                 "title": title,
                 "summary": summary,
                 "url": url,
-                "publishedAt": published.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "publishedAt": effective_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "affectedLines": lines,
                 "active": True,
             }
@@ -202,36 +213,93 @@ def parse_wp_posts(
     return alerts
 
 
-def fetch_json(url: str, timeout: int = 12) -> list[dict]:
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": USER_AGENT,
-            "Accept": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read(512 * 1024).decode("utf-8", errors="replace")
-    data = json.loads(raw)
+def fetch_json_object(url: str, timeout: int = FETCH_TIMEOUT_SECONDS, retries: int = FETCH_RETRIES) -> object:
+    last_exc: Exception | None = None
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "application/json",
+                    "Accept-Language": "pt-PT,pt;q=0.9",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read(512 * 1024).decode("utf-8", errors="replace")
+            return json.loads(raw)
+        except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(attempt * 2)
+    assert last_exc is not None
+    raise last_exc
+
+
+def fetch_json(url: str, timeout: int = FETCH_TIMEOUT_SECONDS, retries: int = FETCH_RETRIES) -> list[dict]:
+    data = fetch_json_object(url, timeout=timeout, retries=retries)
     if not isinstance(data, list):
         raise ValueError(f"Expected JSON array from {url}")
     return data
 
 
-def build_feed(now: dt.datetime | None = None, max_age_days: int = DEFAULT_MAX_AGE_DAYS) -> dict:
+def load_fallback_alerts_by_operator(fallback_url: str | None) -> dict[str, list[dict]]:
+    if not fallback_url:
+        return {}
+    try:
+        data = fetch_json_object(fallback_url, timeout=15, retries=2)
+    except Exception as exc:
+        print(f"[warn] Could not load fallback feed {fallback_url}: {exc}", file=sys.stderr)
+        return {}
+    if not isinstance(data, dict) or not isinstance(data.get("alerts"), list):
+        return {}
+    grouped: dict[str, list[dict]] = {}
+    for item in data["alerts"]:
+        if not isinstance(item, dict):
+            continue
+        op = str(item.get("operator") or "").upper()
+        url = validate_official_url(str(item.get("url") or ""))
+        if not op or not url or not item.get("id") or not item.get("title"):
+            continue
+        grouped.setdefault(op, []).append(item)
+    return grouped
+
+
+def build_feed(
+    now: dt.datetime | None = None,
+    max_age_days: int | None = None,
+    fallback_url: str | None = DEFAULT_FALLBACK_URL,
+) -> dict:
     current = (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
     collected: list[dict] = []
     seen_ids: set[str] = set()
+    failed_operators: list[str] = []
 
-    for operator, url in SOURCES:
+    for operator, url, default_days in SOURCES:
+        effective_days = max_age_days if max_age_days is not None else default_days
         try:
             posts = fetch_json(url)
-            for item in parse_wp_posts(operator, posts, current, max_age_days=max_age_days):
+            for item in parse_wp_posts(operator, posts, current, max_age_days=effective_days):
                 if item["id"] not in seen_ids:
                     seen_ids.add(item["id"])
                     collected.append(item)
         except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
             print(f"[warn] Failed to fetch {operator}: {exc}", file=sys.stderr)
+            failed_operators.append(operator)
+
+    if failed_operators and fallback_url:
+        fallback_by_op = load_fallback_alerts_by_operator(fallback_url)
+        for operator in failed_operators:
+            preserved = fallback_by_op.get(operator, [])
+            if preserved:
+                print(
+                    f"[info] Preserved {len(preserved)} previous {operator} alerts from fallback feed",
+                    file=sys.stderr,
+                )
+            for item in preserved:
+                if item["id"] not in seen_ids:
+                    seen_ids.add(item["id"])
+                    collected.append(item)
 
     collected.sort(key=lambda a: (a["publishedAt"], a["id"]), reverse=True)
     return {
@@ -244,10 +312,11 @@ def build_feed(now: dt.datetime | None = None, max_age_days: int = DEFAULT_MAX_A
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Generate avisos.json for Mobilidade Coimbra")
     parser.add_argument("--output", type=Path, required=True, help="Output JSON path")
-    parser.add_argument("--max-age-days", type=int, default=DEFAULT_MAX_AGE_DAYS)
+    parser.add_argument("--max-age-days", type=int, default=None)
+    parser.add_argument("--fallback-url", type=str, default=DEFAULT_FALLBACK_URL)
     args = parser.parse_args(argv)
 
-    feed = build_feed(max_age_days=args.max_age_days)
+    feed = build_feed(max_age_days=args.max_age_days, fallback_url=args.fallback_url)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         json.dumps(feed, ensure_ascii=False, separators=(",", ":")),
