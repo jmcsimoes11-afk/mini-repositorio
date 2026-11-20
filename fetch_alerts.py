@@ -32,11 +32,13 @@ SOURCES = (
         "SMTUC",
         "https://www.smtuc.pt/wp-json/wp/v2/posts?_fields=id,date_gmt,modified_gmt,link,title,excerpt&per_page=20",
         45,
+        False,
     ),
     (
         "SIT",
         "https://sit-regiaodecoimbra.pt/wp-json/wp/v2/posts?_fields=id,date_gmt,modified_gmt,link,title,excerpt&per_page=20",
         180,
+        True,
     ),
 )
 
@@ -171,11 +173,17 @@ def truncate_summary(text: str, limit: int = MAX_SUMMARY_CHARS) -> str:
     return (cut or text[: limit - 1]) + "…"
 
 
+def is_avisos_url(url: str) -> bool:
+    path = (urlparse(url).path or "").lower()
+    return "/avisos/" in path
+
+
 def parse_wp_posts(
     operator: str,
     posts: Iterable[dict],
     now: dt.datetime,
     max_age_days: int = DEFAULT_MAX_AGE_DAYS,
+    prefer_avisos_path: bool = False,
 ) -> list[dict]:
     cutoff = now - dt.timedelta(days=max_age_days)
     alerts: list[dict] = []
@@ -210,6 +218,10 @@ def parse_wp_posts(
                 "active": True,
             }
         )
+    if prefer_avisos_path:
+        avisos_only = [item for item in alerts if is_avisos_url(item["url"])]
+        if avisos_only:
+            return avisos_only
     return alerts
 
 
@@ -275,11 +287,17 @@ def build_feed(
     seen_ids: set[str] = set()
     failed_operators: list[str] = []
 
-    for operator, url, default_days in SOURCES:
+    for operator, url, default_days, prefer_avisos_path in SOURCES:
         effective_days = max_age_days if max_age_days is not None else default_days
         try:
             posts = fetch_json(url)
-            for item in parse_wp_posts(operator, posts, current, max_age_days=effective_days):
+            for item in parse_wp_posts(
+                operator,
+                posts,
+                current,
+                max_age_days=effective_days,
+                prefer_avisos_path=prefer_avisos_path,
+            ):
                 if item["id"] not in seen_ids:
                     seen_ids.add(item["id"])
                     collected.append(item)

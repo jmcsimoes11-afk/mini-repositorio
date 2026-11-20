@@ -96,6 +96,31 @@ class FetchAlertsTest(unittest.TestCase):
 
         self.assertEqual([a["id"] for a in feed["alerts"]], ["smtuc-1", "sit-2732"])
 
+    def test_prefer_avisos_path_filters_noticias_unless_empty(self):
+        now = dt.datetime(2026, 11, 20, 12, 0, tzinfo=dt.timezone.utc)
+        mixed = [
+            {
+                "id": 2732,
+                "date_gmt": "2026-11-17T15:50:12",
+                "link": "https://sit-regiaodecoimbra.pt/avisos/desvio/2026/desvio-l102/",
+                "title": {"rendered": "DESVIO L102"},
+                "excerpt": {"rendered": "<p>Desvio</p>"},
+            },
+            {
+                "id": 2319,
+                "date_gmt": "2026-11-10T10:00:00",
+                "link": "https://sit-regiaodecoimbra.pt/noticias/2026/linhas-rapidas/",
+                "title": {"rendered": "Linhas Rápidas SIT"},
+                "excerpt": {"rendered": "<p>Campanha</p>"},
+            },
+        ]
+        filtered = fetch_alerts.parse_wp_posts("SIT", mixed, now, max_age_days=45, prefer_avisos_path=True)
+        self.assertEqual([a["id"] for a in filtered], ["sit-2732"])
+
+        only_noticias = [mixed[1]]
+        fallback = fetch_alerts.parse_wp_posts("SIT", only_noticias, now, max_age_days=45, prefer_avisos_path=True)
+        self.assertEqual([a["id"] for a in fallback], ["sit-2319"])
+
 
 if __name__ == "__main__":
     unittest.main()
