@@ -6,6 +6,8 @@ on:
   push:
     paths:
       - "schedule_releases.json"
+      - "fetch_alerts.py"
+      - ".github/workflows/update-alerts.yml"
   workflow_dispatch:
 
 permissions:
@@ -25,30 +27,37 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Run aggregator unit tests
         run: python3 -m unittest discover -s . -p "test_*.py"
 
+      - name: Fetch previous published alerts as fallback
+        run: |
+          mkdir -p public
+          curl -fsSL "https://jmcsimoes11-afk.github.io/mini-repositorio/avisos.json" -o public/avisos.json || true
+
       - name: Fetch service alerts
         run: python3 fetch_alerts.py --output public/avisos.json
 
-      - name: Publish schedule release manifest
-        run: cp schedule_releases.json public/schedule_releases.json
+      - name: Validate and publish schedule release manifest
+        run: |
+          python3 -m json.tool schedule_releases.json > /dev/null
+          cp schedule_releases.json public/schedule_releases.json
 
       - name: Setup Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: public
 
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
